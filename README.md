@@ -1,4 +1,4 @@
-# 🚀🤖 DocuMind - Advanced Open Source RAG Application
+# 🤖 DocuMind - Advanced Open Source RAG Application
 
 ## 📋 Overview
 
