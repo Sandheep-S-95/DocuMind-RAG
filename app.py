@@ -13,7 +13,6 @@ load_dotenv(
     override=True
 )
 
-import gdrive_sync
 import rag_core
 
 # ---------------------------------------------------------------------------
@@ -33,8 +32,7 @@ st.set_page_config(
 def warm_up_resources():
     """
     Pre-warm the LLM, embedding model, and Tavily client by triggering
-    their lru_cached constructors. Called once at startup so the first
-    user query doesn't pay the cold-start penalty.
+    their lru_cached constructors.
     """
     try:
         rag_core._get_embeddings()
@@ -69,34 +67,11 @@ with st.sidebar:
     if DRIVE_URL:
         st.caption(f"Google Drive folder linked")
         if st.button("🔄 Sync from Google Drive", use_container_width=True):
-            with st.spinner("Syncing files from Google Drive …"):
-                sync_result = gdrive_sync.sync_drive_to_local(
-                    drive_url=DRIVE_URL,
-                    kb_dir=rag_core.KB_DIR,
-                )
-            added = sync_result["added"]
-            deleted = sync_result["deleted"]
-            errors = sync_result["errors"]
-
-            if errors:
-                st.error(f"Sync errors: {'; '.join(errors)}")
-            elif not added and not deleted:
-                st.success("✅ Already up to date — no changes on Drive.")
-            else:
-                msgs = []
-                if added:
-                    msgs.append(f"↑ {len(added)} file(s) updated/added")
-                if deleted:
-                    msgs.append(f"↓ {len(deleted)} file(s) removed")
-                st.success("; ".join(msgs))
-
-            # Trigger re-index if anything changed on disk
-            if (added or deleted) and not rag_core.GLOBAL_STATE["is_indexing"]:
-                rag_core.start_observer_sync()
-            st.rerun()
+            if not rag_core.GLOBAL_STATE["is_indexing"]:
+                rag_core.start_observer_sync(DRIVE_URL)
+                st.rerun()
     else:
         st.warning("KNOWLEDGE_BASE_DRIVE_LINK not set in .env")
-
 
     st.divider()
 
@@ -117,13 +92,12 @@ with st.sidebar:
         st.warning("TAVILY_API_KEY not set — web search disabled.")
 
 # ---------------------------------------------------------------------------
-# Kick off indexing if we have files and need to sync/load them
+# One-time auto-sync on startup if the database is empty
 # ---------------------------------------------------------------------------
-has_local_files = len(rag_core._current_kb_files()) > 0
-
-if has_local_files and not rag_core.GLOBAL_STATE["is_indexing"]:
-    if rag_core.GLOBAL_STATE["retriever"] is None or rag_core.detect_directory_mutation():
-        rag_core.start_observer_sync()
+if "first_sync_attempted" not in st.session_state:
+    st.session_state.first_sync_attempted = True
+    if rag_core.GLOBAL_STATE["retriever"] is None and not rag_core.GLOBAL_STATE["is_indexing"] and DRIVE_URL:
+        rag_core.start_observer_sync(DRIVE_URL)
 
 # ---------------------------------------------------------------------------
 # Indexing gate: block the UI while background thread is working
@@ -155,10 +129,10 @@ with col_kb:
     st.success(rag_core.GLOBAL_STATE["status_message"])
 
     with st.expander("📄 Indexed documents", expanded=True):
-        manifest = rag_core._load_manifest()
-        if manifest:
-            for path in sorted(manifest):
-                st.text(f"• {os.path.basename(path)}")
+        files = rag_core.GLOBAL_STATE.get("indexed_files", [])
+        if files:
+            for fname in sorted(files):
+                st.text(f"• {fname}")
         else:
             st.caption("No documents indexed yet.")
 

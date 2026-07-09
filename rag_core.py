@@ -1,17 +1,12 @@
 """
 rag_core.py
 -----------
-All RAG/indexing logic with ZERO Streamlit imports.
-
-Architecture changes vs original:
-  - ChromaDB CLOUD (chromadb.CloudClient) instead of local SQLite embed.
-  - Tavily web search is run alongside vector retrieval in get_answer().
-  - .env is loaded via python-dotenv so secrets never need to be typed by hand.
-  - LLM, Embeddings, and the Tavily client are each memoized with
-    functools.lru_cache so they are initialised exactly once per process.
-  - bootstrap_from_disk() now probes the cloud collection doc-count instead
-    of checking for a local chroma_db/ directory.
-  - Everything else (locking, incremental indexing, GLOBAL_STATE) is unchanged.
+Stateless cloud-native RAG core.
+- Connects directly to Chroma Cloud (no local database).
+- Syncs PDFs from Google Drive into a temporary directory using gdown, 
+  indexes them, and cleans up immediately (no local files are kept).
+- Stores index metadata (filenames and sizes) directly in Chroma Cloud's 
+  chunk metadata, eliminating the need for local manifest files.
 """
 
 import functools
@@ -19,11 +14,13 @@ import glob
 import json
 import logging
 import os
+import re
+import tempfile
 import threading
 
 from dotenv import load_dotenv
 
-# Load .env from the project root before anything touches os.environ
+# Load .env from the project root
 load_dotenv(
     dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"),
     override=True
@@ -39,17 +36,11 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Paths / config
+# Constants
 # ---------------------------------------------------------------------------
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-KB_DIR = os.path.join(BASE_DIR, "knowledge_base_dir")
-MANIFEST_FILE = os.path.join(BASE_DIR, "kb_manifest.json")
-
 EMBEDDING_MODEL = "models/gemini-embedding-2"
 LLM_MODEL = "gemini-2.5-flash"
 CHROMA_COLLECTION = "documind_kb"
-
-os.makedirs(KB_DIR, exist_ok=True)
 
 # ---------------------------------------------------------------------------
 # Shared cross-thread state
@@ -60,11 +51,12 @@ GLOBAL_STATE: dict = {
     "is_indexing": False,
     "status_message": "Initializing …",
     "doc_count": 0,
+    "indexed_files": [],
 }
 
 
 # ---------------------------------------------------------------------------
-# Cached, lazily-initialised heavy objects (one per process)
+# Cached, lazily-initialised heavy objects
 # ---------------------------------------------------------------------------
 
 @functools.lru_cache(maxsize=1)
@@ -100,7 +92,7 @@ def _get_chroma_client():
 
 @functools.lru_cache(maxsize=1)
 def _get_web_search():
-    """Return a Tavily search tool; cached for the life of the process."""
+    """Return a Tavily search tool."""
     from langchain_community.tools.tavily_search import TavilySearchResults
 
     api_key = os.environ.get("TAVILY_API_KEY", "")
@@ -114,7 +106,7 @@ def _get_web_search():
 # ---------------------------------------------------------------------------
 
 def _open_vectorstore() -> Chroma:
-    """Open (or reuse) the cloud-backed Chroma vector store."""
+    """Open the cloud-backed Chroma vector store."""
     return Chroma(
         client=_get_chroma_client(),
         collection_name=CHROMA_COLLECTION,
@@ -123,131 +115,176 @@ def _open_vectorstore() -> Chroma:
 
 
 # ---------------------------------------------------------------------------
-# Manifest helpers (tracks what's been indexed locally)
+# Cloud metadata state helpers (Chroma Cloud is the single source of truth)
 # ---------------------------------------------------------------------------
 
-def _load_manifest() -> dict:
-    if not os.path.exists(MANIFEST_FILE):
-        return {}
+def get_indexed_files_from_cloud() -> dict[str, int]:
+    """Query Chroma Cloud to get {filename: file_size} of currently indexed documents."""
     try:
-        with open(MANIFEST_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError):
+        vectorstore = _open_vectorstore()
+        results = vectorstore._collection.get(include=["metadatas"])
+        metadatas = results.get("metadatas", [])
+        
+        files = {}
+        for meta in metadatas:
+            if meta and "source" in meta:
+                fname = os.path.basename(meta["source"])
+                fsize = meta.get("file_size", 0)
+                files[fname] = fsize
+        return files
+    except Exception as exc:
+        print(f"[METADATA] [ERROR] Failed to fetch indexed files from cloud: {exc}", flush=True)
         return {}
 
 
-def _save_manifest(manifest: dict) -> None:
-    with open(MANIFEST_FILE, "w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=2)
-
-
-def _current_kb_files() -> dict:
-    """Return {absolute_path: mtime} for every PDF currently on disk."""
-    files = glob.glob(os.path.join(KB_DIR, "*.pdf"))
-    return {os.path.abspath(p): os.path.getmtime(p) for p in files}
-
-
-def detect_directory_mutation() -> bool:
-    """Cheap check: does the disk state differ from the saved manifest?"""
-    return _current_kb_files() != _load_manifest()
+def _extract_folder_id(drive_url: str) -> str:
+    """Extract the raw folder ID from a Google Drive URL."""
+    match = re.search(r"/folders/([a-zA-Z0-9_-]+)", drive_url)
+    if match:
+        return match.group(1)
+    return drive_url.split("?")[0].strip("/").split("/")[-1]
 
 
 # ---------------------------------------------------------------------------
 # Indexing (runs in a background thread)
 # ---------------------------------------------------------------------------
 
-def run_incremental_indexing() -> None:
+def run_incremental_indexing(drive_url: str) -> None:
     """
-    Diffs knowledge_base_dir against the manifest and applies only the
-    deltas (add / modify / delete) to the cloud Chroma collection.
+    Downloads files from Google Drive to a temporary directory, checks for 
+    changes against current Chroma Cloud metadata, and updates the database.
     """
+    import gdown
+
     with _lock:
-        GLOBAL_STATE["status_message"] = "Scanning knowledge base for changes …"
+        GLOBAL_STATE["status_message"] = "Connecting to Google Drive …"
 
-    print("\n[INDEXING] Scanning local directory for changes ...", flush=True)
+    folder_id = _extract_folder_id(drive_url)
+    print(f"\n[INDEXING] Starting sync for Google Drive folder ID: {folder_id} ...", flush=True)
+
     try:
-        current = _current_kb_files()
-        manifest = _load_manifest()
+        # Create a temporary directory that cleans up automatically
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            print("[INDEXING] Downloading folder contents using gdown to temp directory...", flush=True)
+            downloaded = gdown.download_folder(
+                id=folder_id,
+                output=tmp_dir,
+                quiet=True,
+                use_cookies=False,
+            )
+            if not downloaded:
+                downloaded = []
 
-        deleted = [p for p in manifest if p not in current]
-        added_or_modified = [p for p, m in current.items() if manifest.get(p) != m]
+            # Filter PDFs
+            pdf_paths = [
+                p for p in downloaded
+                if p and p.lower().endswith(".pdf") and os.path.exists(p)
+            ]
 
-        print(f"[INDEXING] Scanning complete. Local folder contains {len(current)} PDF(s).", flush=True)
-        if deleted:
-            print(f"[INDEXING] Detected deleted PDFs: {[os.path.basename(p) for p in deleted]}", flush=True)
-        if added_or_modified:
-            print(f"[INDEXING] Detected new/modified PDFs: {[os.path.basename(p) for p in added_or_modified]}", flush=True)
+            temp_files = {os.path.basename(p): os.path.getsize(p) for p in pdf_paths}
+            print(f"[INDEXING] Google Drive folder contains {len(temp_files)} PDF(s).", flush=True)
 
-        if not current:
-            _save_manifest({})
-            with _lock:
-                GLOBAL_STATE["retriever"] = None
-                GLOBAL_STATE["doc_count"] = 0
-                GLOBAL_STATE["status_message"] = "Knowledge base is empty. Sync from Google Drive to begin."
-            print("[INDEXING] Local knowledge base folder is empty. Cleared manifest.\n", flush=True)
-            return
+            # Get database status directly from Chroma Cloud
+            print("[INDEXING] Fetching current database status from Chroma Cloud ...", flush=True)
+            cloud_files = get_indexed_files_from_cloud()
+            print(f"[INDEXING] Chroma Cloud contains {len(cloud_files)} indexed document(s).", flush=True)
 
-        vectorstore = _open_vectorstore()
+            deleted = [name for name in cloud_files if name not in temp_files]
+            added_or_modified = [name for name, size in temp_files.items() if cloud_files.get(name) != size]
 
-        # Purge stale vectors first
-        for path in deleted + added_or_modified:
-            fname = os.path.basename(path)
-            try:
-                print(f"[INDEXING] [CHROMA] Purging existing vectors for source file: {fname} ...", flush=True)
-                vectorstore._collection.delete(where={"source": path})
-            except Exception as e:
-                print(f"[INDEXING] [CHROMA] [WARNING] Failed to delete existing vectors for {fname}: {e}", flush=True)
-                pass
-            if path in deleted:
-                manifest.pop(path, None)
+            if deleted:
+                print(f"[INDEXING] Detected deleted PDFs: {deleted}", flush=True)
+            if added_or_modified:
+                print(f"[INDEXING] Detected new/modified PDFs: {added_or_modified}", flush=True)
 
-        # Re-embed new / changed files
-        splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
-        failures: list[str] = []
-
-        for path in added_or_modified:
-            fname = os.path.basename(path)
-            try:
+            if not temp_files and not cloud_files:
                 with _lock:
-                    GLOBAL_STATE["status_message"] = (
-                        f"Indexing {fname} …"
+                    GLOBAL_STATE["retriever"] = None
+                    GLOBAL_STATE["doc_count"] = 0
+                    GLOBAL_STATE["status_message"] = "Knowledge base is empty. Sync from Google Drive to begin."
+                print("[INDEXING] Google Drive is empty and database is clean.\n", flush=True)
+                return
+
+            vectorstore = _open_vectorstore()
+
+            # 1. Purge deleted/modified documents by matching ID metadata
+            if deleted or added_or_modified:
+                print("[INDEXING] [CHROMA] Checking for stale database records to purge ...", flush=True)
+                results = vectorstore._collection.get(include=["metadatas"])
+                metadatas = results.get("metadatas", [])
+                ids = results.get("ids", [])
+                
+                ids_to_delete = []
+                for i, meta in enumerate(metadatas):
+                    if meta and "source" in meta:
+                        fname = os.path.basename(meta["source"])
+                        if fname in deleted or fname in added_or_modified:
+                            ids_to_delete.append(ids[i])
+                
+                if ids_to_delete:
+                    print(f"[INDEXING] [CHROMA] Deleting {len(ids_to_delete)} stale vector chunks ...", flush=True)
+                    vectorstore._collection.delete(ids=ids_to_delete)
+                    print("[INDEXING] [CHROMA] Purge complete.", flush=True)
+
+            # 2. Embed new / changed files
+            splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
+            failures: list[str] = []
+
+            for fname in added_or_modified:
+                path = None
+                # Locate path in temp dir
+                for p in pdf_paths:
+                    if os.path.basename(p) == fname:
+                        path = p
+                        break
+
+                if not path:
+                    continue
+
+                fsize = temp_files[fname]
+                try:
+                    with _lock:
+                        GLOBAL_STATE["status_message"] = f"Indexing {fname} …"
+                    print(f"[INDEXING] [PDF] Loading {fname} ...", flush=True)
+                    loader = PyPDFLoader(path)
+                    docs = loader.load()
+                    for d in docs:
+                        # Save source name and file size in chunk metadata
+                        d.metadata["source"] = fname
+                        d.metadata["file_size"] = fsize
+                    print(f"[INDEXING] [PDF] Loaded {len(docs)} pages from {fname}.", flush=True)
+                    
+                    chunks = splitter.split_documents(docs)
+                    print(f"[INDEXING] [SPLIT] Split {fname} into {len(chunks)} text chunks.", flush=True)
+                    
+                    if chunks:
+                        print(f"[INDEXING] [CHROMA] Embedding and uploading {len(chunks)} chunks to Chroma Cloud ...", flush=True)
+                        vectorstore.add_documents(chunks)
+                        print(f"[INDEXING] [CHROMA] Successfully uploaded chunks for {fname}.", flush=True)
+                except Exception as exc:
+                    print(f"[INDEXING] [ERROR] Failed to process {fname}: {exc}", flush=True)
+                    import traceback
+                    traceback.print_exc()
+                    failures.append(f"{fname} ({exc})")
+
+            # Final status update
+            final_files = get_indexed_files_from_cloud()
+            with _lock:
+                GLOBAL_STATE["doc_count"] = len(final_files)
+                GLOBAL_STATE["indexed_files"] = list(final_files.keys())
+                if final_files:
+                    GLOBAL_STATE["retriever"] = vectorstore.as_retriever(
+                        search_kwargs={"k": 4}
                     )
-                print(f"[INDEXING] [PDF] Loading {fname} ...", flush=True)
-                loader = PyPDFLoader(path)
-                docs = loader.load()
-                for d in docs:
-                    d.metadata["source"] = path
-                print(f"[INDEXING] [PDF] Loaded {len(docs)} pages from {fname}.", flush=True)
-                
-                chunks = splitter.split_documents(docs)
-                print(f"[INDEXING] [SPLIT] Split {fname} into {len(chunks)} text chunks.", flush=True)
-                
-                if chunks:
-                    print(f"[INDEXING] [CHROMA] Embedding and uploading {len(chunks)} chunks to Chroma Cloud ...", flush=True)
-                    vectorstore.add_documents(chunks)
-                    print(f"[INDEXING] [CHROMA] Successfully uploaded chunks for {fname}.", flush=True)
-                manifest[path] = current[path]
-            except Exception as exc:
-                print(f"[INDEXING] [ERROR] Failed to process {fname}: {exc}", flush=True)
-                failures.append(f"{fname} ({exc})")
+                    msg = f"Online. {len(final_files)} document(s) indexed."
+                    if failures:
+                        msg += f" Skipped (will retry): {', '.join(failures)}"
+                    GLOBAL_STATE["status_message"] = msg
+                else:
+                    GLOBAL_STATE["retriever"] = None
+                    GLOBAL_STATE["status_message"] = "No documents could be indexed."
 
-        _save_manifest(manifest)
-
-        with _lock:
-            GLOBAL_STATE["doc_count"] = len(manifest)
-            if manifest:
-                GLOBAL_STATE["retriever"] = vectorstore.as_retriever(
-                    search_kwargs={"k": 4}
-                )
-                msg = f"Online. {len(manifest)} document(s) indexed."
-                if failures:
-                    msg += f" Skipped (will retry): {', '.join(failures)}"
-                GLOBAL_STATE["status_message"] = msg
-            else:
-                GLOBAL_STATE["retriever"] = None
-                GLOBAL_STATE["status_message"] = "No documents could be indexed."
-
-        print(f"[INDEXING] Finished incremental run. Total indexed docs: {len(manifest)}.\n", flush=True)
+            print(f"[INDEXING] Finished incremental run. Total indexed docs: {len(final_files)}.\n", flush=True)
 
     except Exception as exc:
         print(f"[INDEXING] [FATAL ERROR] {exc}", flush=True)
@@ -260,17 +297,14 @@ def run_incremental_indexing() -> None:
             GLOBAL_STATE["is_indexing"] = False
 
 
-def start_observer_sync() -> None:
-    """
-    Atomically check-and-set is_indexing under the lock BEFORE spawning the
-    thread, preventing duplicate concurrent indexing runs.
-    """
+def start_observer_sync(drive_url: str) -> None:
+    """Atomically check-and-set is_indexing and spawn background thread."""
     with _lock:
         if GLOBAL_STATE["is_indexing"]:
             return
         GLOBAL_STATE["is_indexing"] = True
 
-    thread = threading.Thread(target=run_incremental_indexing, daemon=True)
+    thread = threading.Thread(target=run_incremental_indexing, args=(drive_url,), daemon=True)
     thread.start()
 
 
@@ -281,32 +315,27 @@ def bootstrap_from_disk() -> None:
     the retriever immediately so the first user request doesn't have to wait
     for a full re-index.
     """
-    print("\n[BOOTSTRAP] Connecting to cloud Chroma and verifying local manifest ...", flush=True)
-    manifest = _load_manifest()
-    if not manifest:
-        with _lock:
-            GLOBAL_STATE["status_message"] = "Knowledge base is empty. Sync from Google Drive to begin."
-        print("[BOOTSTRAP] Local manifest is empty. No documents to load.\n", flush=True)
-        return
-
+    print("\n[BOOTSTRAP] Connecting to cloud Chroma and verifying database status ...", flush=True)
     try:
         vectorstore = _open_vectorstore()
         count = vectorstore._collection.count()
         print(f"[BOOTSTRAP] Chroma Cloud database contains {count} vector records.", flush=True)
         if count > 0:
+            cloud_files = get_indexed_files_from_cloud()
             with _lock:
                 GLOBAL_STATE["retriever"] = vectorstore.as_retriever(
                     search_kwargs={"k": 4}
                 )
-                GLOBAL_STATE["doc_count"] = len(manifest)
+                GLOBAL_STATE["doc_count"] = len(cloud_files)
+                GLOBAL_STATE["indexed_files"] = list(cloud_files.keys())
                 GLOBAL_STATE["status_message"] = (
-                    f"Online. {len(manifest)} document(s) indexed."
+                    f"Online. {len(cloud_files)} document(s) indexed."
                 )
-            print(f"[BOOTSTRAP] Successfully initialized retriever from cloud with {len(manifest)} local files recorded.\n", flush=True)
+            print(f"[BOOTSTRAP] Successfully initialized retriever from cloud with {len(cloud_files)} files: {list(cloud_files.keys())}\n", flush=True)
         else:
             with _lock:
                 GLOBAL_STATE["status_message"] = (
-                    "Connected to cloud. Knowledge base not indexed yet."
+                    "Connected to cloud. Knowledge base is empty. Sync from Google Drive to begin."
                 )
             print("[BOOTSTRAP] Connected to cloud. Cloud database is empty.\n", flush=True)
     except Exception as exc:

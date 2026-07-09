@@ -20,6 +20,9 @@ import os
 import sys
 import time
 
+from dotenv import load_dotenv
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"), override=True)
+
 from rouge_score import rouge_scorer
 
 import rag_core
@@ -72,8 +75,13 @@ def run():
         print("ERROR: set GOOGLE_API_KEY before running this test.")
         sys.exit(1)
 
+    drive_url = os.environ.get("KNOWLEDGE_BASE_DRIVE_LINK", "")
+    if not drive_url:
+        print("ERROR: KNOWLEDGE_BASE_DRIVE_LINK not set in .env")
+        sys.exit(1)
+
     print("Running indexing synchronously (no Streamlit / no background thread needed for testing)...")
-    rag_core.run_incremental_indexing()
+    rag_core.run_incremental_indexing(drive_url)
     print(rag_core.GLOBAL_STATE["status_message"])
 
     if rag_core.GLOBAL_STATE["retriever"] is None:
