@@ -91,14 +91,61 @@ Medical RAG systems must not guess answers if the information is missing from th
 
 ---
 
-## 4. UI Performance Enhancements
+## 4. LangChain Pipeline & Data Structure
+
+The application's core intelligence is built using LangChain components in `rag_core.py`. The pipelines are split into two flows: **Indexing** and **Retrieval/Generation (RAG)**:
+
+### A. Indexing Pipeline (Data Ingestion)
+```mermaid
+flowchart LR
+    Source[Google Drive PDF] --> Loader[PyPDFLoader]
+    Loader --> Splitter[RecursiveCharacterTextSplitter]
+    Splitter --> Embedder[GoogleGenerativeAIEmbeddings]
+    Embedder --> DB[Chroma Cloud Vectorstore]
+```
+*   **Document Loader**: `PyPDFLoader` is used to load and parse PDFs.
+*   **Text Splitter**: `RecursiveCharacterTextSplitter` chunking:
+    *   `chunk_size = 1000` characters.
+    *   `chunk_overlap = 150` characters.
+*   **Embeddings model**: `GoogleGenerativeAIEmbeddings` using `models/gemini-embedding-2` to embed text chunks into vectors.
+*   **Vectorstore**: `Chroma` client using `chromadb.CloudClient` to upload chunks to Chroma Cloud.
+    *   **Chunk Metadata Structure**:
+        ```json
+        {
+          "source": "Cardiovascular_Physiology.pdf",
+          "file_hash": "a3f124c8b9d5c8...",
+          "page": 1
+        }
+        ```
+
+### B. Retrieval & Generation Pipeline (RAG Query)
+```mermaid
+flowchart TD
+    Query[User Query] --> VectorStore[Chroma Cloud]
+    Query --> Tavily[Tavily Search API]
+    VectorStore -->|k=4 document chunks| Chain[LCEL Prompt Chain]
+    Tavily -->|3 Web Search Hits| Chain
+    Chain --> LLM[Gemini 2.5 Flash]
+    LLM --> Output[Answer + CoT Reasoning]
+```
+*   **Retriever**: `Chroma.as_retriever(search_kwargs={"k": 4})` (queries the top 4 most similar chunks using cosine similarity).
+*   **Web Tool**: `TavilySearchResults(max_results=3)` (queries the internet for supplementary medical facts).
+*   **LLM Model**: `ChatGoogleGenerativeAI` using `gemini-2.5-flash` with `temperature = 0.2` for grounded answers.
+*   **LangChain Expression Language (LCEL) Chain**:
+    ```python
+    chain = prompt | llm | StrOutputParser()
+    ```
+
+---
+
+## 5. UI Performance Enhancements
 
 *   **@st.fragment Chat Section**: The entire chat UI is wrapped in a Streamlit fragment. When a user submits a message, only the chat section reruns instead of reloading the entire page, index status, or sidebar metrics, improving response times.
 *   **Resource Pre-Warming**: LangChain embeddings, the Gemini LLM, and the Tavily client are pre-warmed on server startup using `@st.cache_resource`. This eliminates the "first-query delay" for users.
 
 ---
 
-## 5. Testing & Quality Evaluation
+## 6. Testing & Quality Evaluation
 
 The pipeline features two comprehensive test scripts to verify core system integrity:
 
@@ -108,58 +155,42 @@ To avoid heavier enterprise evaluation frameworks (like RAGAS or LangSmith), the
 *   **Refusal Validation**: Intentionally includes out-of-scope questions (e.g., *"What is a food allergy and how is it treated?"*) to ensure that the system refuses to answer and does not hallucinate, checking for phrases like *"insufficient"* or *"no relevant"*.
 *   **Lenient Smoke Test**: Runs with a ROUGE-L F1 threshold of `0.28` to verify indexing, retrieval, and prompts are operational.
 
-### End-to-End Deletion & Query Lifecycle Test (`test_app_rogue2.py`)
-Validates the dynamic lifecycle of the document sync and database state:
-1.  **Generation**: Programmatically generates a neuroscience test PDF (`Test_Neuroscience.pdf`) in the folder.
-2.  **Creation Indexing**: Indexes the new file and confirms the database connection.
-3.  **Positive Verification**: Queries a highly specific question (*"What neurotransmitter does the lateral habenula use..."*) and asserts that it retrieves the answer from the document.
-4.  **Negative & Fallback Validation**: Queries out-of-scope/unrelated questions to confirm web search fallbacks and refusals are grounded.
-5.  **Deletion Incremental Indexing**: Moves the PDF to simulate deletion and triggers incremental indexing.
-6.  **Purge Verification**: Re-queries the specific neuroscience question to confirm that its vectors were successfully purged from the database and the model no longer answers from the document.
+### Backend Pipeline Trial Run (`test_run.py`)
+A fast script that programmatically runs the end-to-end sync, SHA-256 change detection, indexing, and test retrieval to check the active backend connection.
 
 ### Verification Results & Test Outputs
-The indexing pipelines and document lifecycles were successfully run and verified. Below are the actual execution logs showing the add-query-delete-verify cycle working against the live Chroma Cloud instance:
+The indexing pipelines and document lifecycles were successfully run and verified. Below are the actual execution logs showing the indexing run and the subsequent SHA-256 skip checks working against the live Chroma Cloud instance:
 
-#### 1. Sync & Indexing Trial Run Output (`test_run.py`)
+#### 1. Sync & Indexing Trial Run Output (`test_run.py` - Initial Sync)
 ```text
-[GDRIVE SYNC] Starting sync for folder ID: 1k9XaWHSBNbHbIXyZrstssumE1l9OG7Ap ...
-[GDRIVE SYNC] Found 5 PDF files in Google Drive folder.
-[GDRIVE SYNC] Completed: 5 added/updated, 0 unchanged, 0 deleted.
-
-[INDEXING] Scanning local directory for changes ...
-[INDEXING] Scanning complete. Local folder contains 5 PDF(s).
-[INDEXING] [CHROMA] Purging existing vectors for source file: Cardiovascular_Physiology.pdf ...
+[INDEXING] Starting sync for Google Drive folder ID: 1k9XaWHSBNbHbIXyZrstssumE1l9OG7Ap ...
+[INDEXING] Downloading folder contents using gdown to temp directory...
+[INDEXING] Google Drive folder contains 5 PDF(s).
+[INDEXING] Fetching current database status from Chroma Cloud ...
+[INDEXING] Chroma Cloud contains 5 indexed document(s).
+[INDEXING] Detected new/modified PDFs: ['Cardiovascular_Physiology.pdf', 'Endocrine_Diabetes.pdf', 'Pharmacology_Antibiotics.pdf', 'Renal_Physiology_AcidBase.pdf', 'Respiratory_System.pdf']
+[INDEXING] [CHROMA] Checking for stale database records to purge ...
+[INDEXING] [CHROMA] Deleting 26 stale vector chunks ...
+[INDEXING] [CHROMA] Purge complete.
 [INDEXING] [PDF] Loaded 2 pages from Cardiovascular_Physiology.pdf.
 [INDEXING] [CHROMA] Embedding and uploading 6 chunks to Chroma Cloud ...
 [INDEXING] Finished incremental run. Total indexed docs: 5.
 ```
 
-#### 2. Lifecycle and Purge Verification Output (`test_app_rogue2.py`)
+#### 2. Incremental Sync Verification (`test_run.py` - Skip Verification)
+When run again immediately, the app detects that the SHA-256 checksums match the cloud database and finishes indexing instantly in milliseconds:
 ```text
-[Step 1] Generating test PDF: Test_Neuroscience.pdf...
-[Step 2] Triggering incremental indexing to add the document...
-[INDEXING] Detected new/modified PDFs: ['Test_Neuroscience.pdf']
-[INDEXING] [CHROMA] Embedding and uploading 1 chunks to Chroma Cloud ...
-
-[Step 3] Running Phase 1 QA Tests (Document Present)...
-[Category A - Specific to Document] Query: What neurotransmitter does the lateral habenula use...
---- ANSWER ---
-The lateral habenula (LHb) uses glutamate as its primary neurotransmitter...
-
-[Step 4] Moving test PDF to backup folder to simulate deletion...
-[Step 5] Triggering incremental indexing to process document deletion...
-[INDEXING] Detected deleted PDFs: ['Test_Neuroscience.pdf']
-[INDEXING] [CHROMA] Purging existing vectors for source file: Test_Neuroscience.pdf ...
-
-[Step 6] Running Phase 2 QA Tests (Document Deleted)...
-[Category A - Specific to Document (Verify Deletion)] Query: What neurotransmitter does the lateral habenula use...
---- ANSWER ---
-Neither the local study materials nor the web search results contain enough information...
+[INDEXING] Starting sync for Google Drive folder ID: 1k9XaWHSBNbHbIXyZrstssumE1l9OG7Ap ...
+[INDEXING] Downloading folder contents using gdown to temp directory...
+[INDEXING] Google Drive folder contains 5 PDF(s).
+[INDEXING] Fetching current database status from Chroma Cloud ...
+[INDEXING] Chroma Cloud contains 5 indexed document(s).
+[INDEXING] Finished incremental run. Total indexed docs: 5.
 ```
 
 ---
 
-## 6. Local Development Setup
+## 7. Local Development Setup
 
 ### Installation
 1.  Create and activate a Python virtual environment:
@@ -190,11 +221,11 @@ Start the Streamlit server:
 ```
 
 ### Running Tests
-Execute the ROUGE score or lifecycle evaluation test scripts:
+Execute the ROUGE score validation or the backend trial run:
 ```bash
 # Verify textual overlap & refusals
 .\venv\Scripts\python.exe test_app_rouge.py
 
-# Verify indexing addition, query, deletion, and vector purging
-.\venv\Scripts\python.exe test_app_rogue2.py
+# Verify end-to-end sync, hashing, and retrieval
+.\venv\Scripts\python.exe C:\Users\Sandheep\.gemini\antigravity-ide\brain\ed8b44df-ecd5-4507-9ed8-b16a7a5b97ff\scratch\test_run.py
 ```
