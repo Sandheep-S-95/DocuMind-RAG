@@ -118,8 +118,18 @@ def _open_vectorstore() -> Chroma:
 # Cloud metadata state helpers (Chroma Cloud is the single source of truth)
 # ---------------------------------------------------------------------------
 
-def get_indexed_files_from_cloud() -> dict[str, int]:
-    """Query Chroma Cloud to get {filename: file_size} of currently indexed documents."""
+def _calculate_file_hash(filepath: str) -> str:
+    """Calculate SHA-256 hash of a file's content to detect updates reliably."""
+    import hashlib
+    hash_sha256 = hashlib.sha256()
+    with open(filepath, "rb") as f:
+        for chunk in iter(lambda: f.read(4096), b""):
+            hash_sha256.update(chunk)
+    return hash_sha256.hexdigest()
+
+
+def get_indexed_files_from_cloud() -> dict[str, str]:
+    """Query Chroma Cloud to get {filename: file_hash} of currently indexed documents."""
     try:
         vectorstore = _open_vectorstore()
         results = vectorstore._collection.get(include=["metadatas"])
@@ -129,8 +139,8 @@ def get_indexed_files_from_cloud() -> dict[str, int]:
         for meta in metadatas:
             if meta and "source" in meta:
                 fname = os.path.basename(meta["source"])
-                fsize = meta.get("file_size", 0)
-                files[fname] = fsize
+                fhash = meta.get("file_hash", "")
+                files[fname] = fhash
         return files
     except Exception as exc:
         print(f"[METADATA] [ERROR] Failed to fetch indexed files from cloud: {exc}", flush=True)
@@ -181,7 +191,7 @@ def run_incremental_indexing(drive_url: str) -> None:
                 if p and p.lower().endswith(".pdf") and os.path.exists(p)
             ]
 
-            temp_files = {os.path.basename(p): os.path.getsize(p) for p in pdf_paths}
+            temp_files = {os.path.basename(p): _calculate_file_hash(p) for p in pdf_paths}
             print(f"[INDEXING] Google Drive folder contains {len(temp_files)} PDF(s).", flush=True)
 
             # Get database status directly from Chroma Cloud
@@ -190,7 +200,7 @@ def run_incremental_indexing(drive_url: str) -> None:
             print(f"[INDEXING] Chroma Cloud contains {len(cloud_files)} indexed document(s).", flush=True)
 
             deleted = [name for name in cloud_files if name not in temp_files]
-            added_or_modified = [name for name, size in temp_files.items() if cloud_files.get(name) != size]
+            added_or_modified = [name for name, fhash in temp_files.items() if cloud_files.get(name) != fhash]
 
             if deleted:
                 print(f"[INDEXING] Detected deleted PDFs: {deleted}", flush=True)
@@ -241,7 +251,7 @@ def run_incremental_indexing(drive_url: str) -> None:
                 if not path:
                     continue
 
-                fsize = temp_files[fname]
+                fhash = temp_files[fname]
                 try:
                     with _lock:
                         GLOBAL_STATE["status_message"] = f"Indexing {fname} …"
@@ -249,9 +259,9 @@ def run_incremental_indexing(drive_url: str) -> None:
                     loader = PyPDFLoader(path)
                     docs = loader.load()
                     for d in docs:
-                        # Save source name and file size in chunk metadata
+                        # Save source name and file hash in chunk metadata
                         d.metadata["source"] = fname
-                        d.metadata["file_size"] = fsize
+                        d.metadata["file_hash"] = fhash
                     print(f"[INDEXING] [PDF] Loaded {len(docs)} pages from {fname}.", flush=True)
                     
                     chunks = splitter.split_documents(docs)
