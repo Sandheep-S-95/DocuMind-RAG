@@ -22,9 +22,8 @@ flowchart TD
     end
 
     subgraph Background [Background Indexing Thread]
-        Manifest[kb_manifest.json]
-        Scanner[Directory Scanner]
-        GDrive[gdrive_sync.py using gdown]
+        GDrive[gdown sync]
+        TempDir[tempfile.TemporaryDirectory]
         Embedder[Google Generative AI Embeddings]
     end
 
@@ -43,12 +42,12 @@ flowchart TD
 
     %% Flow for Indexing
     UI_Sync --> GDrive
-    GDrive -->|PDF Downloads| Scanner
-    Scanner <--> Manifest
-    Scanner -->|Delta files only| Embedder
-    Scanner -->|Stale files| Chroma
-    Embedder -->|Vector Chunks| Chroma
-    Scanner -->|Update Status| Lock
+    GDrive -->|PDF Downloads| TempDir
+    TempDir <-->|Diff filenames & sizes directly| Chroma
+    TempDir -->|Delta PDF files| Embedder
+    Embedder -->|Vector Chunks + Metadata| Chroma
+    TempDir -->|Automatic Cleanup| Clean[Folder Deleted]
+    TempDir -->|Update Status| Lock
     Lock --- State
 
     %% Flow for Querying
@@ -68,10 +67,10 @@ flowchart TD
 
 While the user interacts with a clean chat interface, several critical flows occur silently behind the scenes:
 
-### Feature A: True Incremental Indexing
+### Feature A: Stateless Incremental Indexing
 Most basic RAG apps re-embed the entire directory every time indexing is triggered, wasting API tokens and execution time.
-*   **Behind the scenes:** The app maintains a lightweight local statefile (`kb_manifest.json`) tracking the exact modification time (`mtime`) and size of every PDF.
-*   **The Flow:** When indexing runs, it performs a delta check. If a file is deleted from the source, it selectively deletes *only* that file's vectors from Chroma Cloud (using metadata filtering). If a file is added or modified, it embeds and uploads *only* that file, drastically reducing overhead.
+*   **Behind the scenes:** The database itself serves as the single source of truth. Document metadata (filenames and file sizes) are stored directly inside Chroma Cloud's chunk metadatas.
+*   **The Flow:** When indexing runs, the PDFs are downloaded to a temporary directory. The app queries Chroma Cloud to get the currently indexed files and their sizes. If a file is deleted from Google Drive, it purges its vectors from Chroma Cloud. If a file is added or modified, it embeds and uploads *only* that file, keeping the system clean and local-storage-free.
 
 ### Feature B: Thread-Safe State Management (Decoupled from Streamlit)
 Streamlit's `st.session_state` is tied to specific browser session context (`ScriptRunContext`). A background thread attempting to update UI state would normally crash Streamlit.
@@ -87,7 +86,7 @@ Medical RAG systems must not guess answers if the information is missing from th
 
 ## 3. Chroma Cloud and Google Drive Integration
 
-*   **Google Drive Syncing (`gdrive_sync.py`)**: Uses `gdown` to connect to a publicly shared Google Drive folder link without requiring OAuth configurations. The sync is incremental (using `gdrive_manifest.json` metadata) to only pull modified/added files, downloading them directly to a local directory before initiating indexing.
+*   **Google Drive Syncing**: Uses `gdown` to connect to a publicly shared Google Drive folder link without requiring OAuth configurations. The files are downloaded directly into a `tempfile.TemporaryDirectory()`, indexed, and automatically deleted, keeping local storage completely clean.
 *   **Chroma Cloud (`CloudClient`)**: Connects to the serverless Chroma Cloud hosting using your account credentials (`CHROMA_TENANT` and `CHROMA_CLOUD_KEY`), avoiding local database storage overhead.
 
 ---
