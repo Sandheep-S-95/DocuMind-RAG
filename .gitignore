@@ -1,0 +1,32 @@
+# Virtual environment
+venv/
+ENV/
+.venv/
+env/
+
+# Environment secrets
+.env
+.env.*
+
+# Python caching
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local database and cache directories
+chroma_db/
+.chroma/
+
+# Local configuration files
+.streamlit/secrets.toml
+
+# Sync and Index state manifests
+gdrive_manifest.json
+kb_manifest.json
+
+# Local document downloads directory (synced from Google Drive)
+knowledge_base_dir/
+
+# OS files
+.DS_Store
+Thumbs.db
