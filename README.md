@@ -43,7 +43,7 @@ flowchart TD
     %% Flow for Indexing
     UI_Sync --> GDrive
     GDrive -->|PDF Downloads| TempDir
-    TempDir <-->|Diff filenames & sizes directly| Chroma
+    TempDir <-->|Diff filenames & SHA-256 hashes directly| Chroma
     TempDir -->|Delta PDF files| Embedder
     Embedder -->|Vector Chunks + Metadata| Chroma
     TempDir -->|Automatic Cleanup| Clean[Folder Deleted]
@@ -69,8 +69,8 @@ While the user interacts with a clean chat interface, several critical flows occ
 
 ### Feature A: Stateless Incremental Indexing
 Most basic RAG apps re-embed the entire directory every time indexing is triggered, wasting API tokens and execution time.
-*   **Behind the scenes:** The database itself serves as the single source of truth. Document metadata (filenames and file sizes) are stored directly inside Chroma Cloud's chunk metadatas.
-*   **The Flow:** When indexing runs, the PDFs are downloaded to a temporary directory. The app queries Chroma Cloud to get the currently indexed files and their sizes. If a file is deleted from Google Drive, it purges its vectors from Chroma Cloud. If a file is added or modified, it embeds and uploads *only* that file, keeping the system clean and local-storage-free.
+*   **Behind the scenes:** The database itself serves as the single source of truth. Document metadata (filenames and SHA-256 cryptographic hashes) are stored directly inside Chroma Cloud's chunk metadatas.
+*   **The Flow:** When indexing runs, the PDFs are downloaded to a temporary directory. The app queries Chroma Cloud to get the currently indexed files and their SHA-256 hashes. If a file is deleted from Google Drive, it purges its vectors from Chroma Cloud. If a file is added or modified (even if the file size remains the same, any content change alters its SHA-256 signature), it embeds and uploads *only* that file, keeping the system clean and local-storage-free.
 
 ### Feature B: Thread-Safe State Management (Decoupled from Streamlit)
 Streamlit's `st.session_state` is tied to specific browser session context (`ScriptRunContext`). A background thread attempting to update UI state would normally crash Streamlit.
