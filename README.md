@@ -1,5 +1,7 @@
 # Documind: MedStudy RAG Assistant
 
+🚀 **Live Deployed App**: [ai-rag-app-ss.streamlit.app](https://ai-rag-app-ss.streamlit.app/)
+
 Documind is a high-performance, cloud-backed Retrieval-Augmented Generation (RAG) study companion designed for medical students. It leverages Google Gemini, Chroma Cloud, and Tavily Web Search to answer complex medical questions. It prioritizes local PDF study materials and falls back to live web searches when necessary, complete with step-by-step chain-of-thought reasoning.
 
 ---
