@@ -55,8 +55,6 @@ if "bootstrapped" not in st.session_state:
 # ---------------------------------------------------------------------------
 # Sidebar — Drive sync & status
 # ---------------------------------------------------------------------------
-DRIVE_URL = os.environ.get("KNOWLEDGE_BASE_DRIVE_LINK", "")
-
 with st.sidebar:
     st.title("🩺 Documind")
     st.caption("MedStudy RAG · Powered by Gemini + Chroma Cloud")
@@ -64,14 +62,19 @@ with st.sidebar:
 
     # ---------- Google Drive Sync ----------
     st.subheader("📂 Knowledge Source")
+    
+    DRIVE_URL = st.text_input(
+        "Google Drive Folder URL",
+        placeholder="https://drive.google.com/drive/folders/..."
+    )
+
     if DRIVE_URL:
-        st.caption(f"Google Drive folder linked")
-        if st.button("🔄 Sync from Google Drive", use_container_width=True):
+        if st.button("Load Knowledge Source", use_container_width=True):
             if not rag_core.GLOBAL_STATE["is_indexing"]:
                 rag_core.start_observer_sync(DRIVE_URL)
                 st.rerun()
     else:
-        st.warning("KNOWLEDGE_BASE_DRIVE_LINK not set in .env")
+        st.warning("Please enter a Google Drive folder URL.")
 
     st.divider()
 

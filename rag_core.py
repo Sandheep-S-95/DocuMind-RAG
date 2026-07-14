@@ -30,6 +30,7 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.vectorstores import Chroma
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnableParallel, RunnableLambda
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
@@ -429,11 +430,27 @@ def get_answer(question: str, history_buffer: str = "") -> dict:
     with _lock:
         retriever = GLOBAL_STATE.get("retriever")
 
-    # --- 1. Local vector retrieval ---
-    local_results_list = []
+    # --- Parallel Retrieval with LangChain ---
+    print("[QUERY] [RETRIEVAL] Triggering parallel retrieval from Chroma and Tavily ...", flush=True)
+    
+    def safe_web_search(q):
+        try:
+            return _get_web_search().invoke(q)
+        except Exception as exc:
+            print(f"[QUERY] [TAVILY] [ERROR] Tavily search failed: {exc}", flush=True)
+            return []
+
+    parallel_dict = {"web": RunnableLambda(safe_web_search)}
     if retriever is not None:
-        print("[QUERY] [CHROMA] Querying local document vectors ...", flush=True)
-        docs = retriever.invoke(question)
+        parallel_dict["local"] = retriever
+        
+    parallel_chain = RunnableParallel(parallel_dict)
+    parallel_results = parallel_chain.invoke(question)
+
+    # --- 1. Process Local vector retrieval ---
+    local_results_list = []
+    if retriever is not None and "local" in parallel_results:
+        docs = parallel_results["local"]
         print(f"[QUERY] [CHROMA] Retrieved {len(docs)} relevant text chunks.", flush=True)
         for i, d in enumerate(docs):
             src = os.path.basename(d.metadata.get("source", "unknown"))
@@ -447,13 +464,12 @@ def get_answer(question: str, history_buffer: str = "") -> dict:
         print("[QUERY] [CHROMA] Retriever not available (empty/indexing DB). Skipping local retrieval.", flush=True)
         local_context = "(Knowledge base is empty or still indexing.)"
 
-    # --- 2. Tavily web search ---
+    # --- 2. Process Tavily web search ---
     web_context = "(Web search unavailable.)"
     web_used = False
     web_results_list = []
-    print("[QUERY] [TAVILY] Triggering Tavily web search ...", flush=True)
-    try:
-        results = _get_web_search().invoke(question)
+    if "web" in parallel_results:
+        results = parallel_results["web"]
         if results:
             print(f"[QUERY] [TAVILY] Retrieved {len(results)} search results.", flush=True)
             snippets = []
@@ -477,9 +493,6 @@ def get_answer(question: str, history_buffer: str = "") -> dict:
             web_used = True
         else:
             print("[QUERY] [TAVILY] Tavily web search returned 0 results.", flush=True)
-    except Exception as exc:
-        print(f"[QUERY] [TAVILY] [ERROR] Tavily search failed: {exc}", flush=True)
-        web_context = f"(Web search failed: {exc})"
 
     # --- 3. LLM chain ---
     print("[QUERY] [LLM] Generating response using Gemini CoT model ...", flush=True)
